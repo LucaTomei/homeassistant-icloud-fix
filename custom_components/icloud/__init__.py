@@ -67,4 +67,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: IcloudConfigEntry) -> bo
 
 async def async_unload_entry(hass: HomeAssistant, entry: IcloudConfigEntry) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        # Stop polling and pyicloud's background thread, otherwise the old
+        # session keeps running (and saving its tokens) after a reload.
+        await hass.async_add_executor_job(entry.runtime_data.shutdown)
+    return unload_ok

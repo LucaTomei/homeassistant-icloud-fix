@@ -9,11 +9,12 @@ from typing import TYPE_CHECKING, Any
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import (
     PyiCloudException,
-    PyiCloudFailedLoginException,
     PyiCloudNoDevicesException,
     PyiCloudNoTrustedNumberAvailable,
     PyiCloudServiceNotActivatedException,
+    PyiCloudServiceUnavailable,
 )
+import requests
 import voluptuous as vol
 
 from homeassistant.config_entries import SOURCE_USER, ConfigFlow, ConfigFlowResult
@@ -246,7 +247,15 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
         if not (self._verified and self.api is not None):
             try:
                 self.api = await self._create_icloud_api()
-            except PyiCloudException as error:
+                if self.api.requires_2fa and not getattr(self.api, "_auth_data", None):
+                    # A saved session token was still accepted, so pyicloud did
+                    # not sign in with the password and has no 2FA challenge:
+                    # Apple would never send a code. Sign in with the password
+                    # to start a real 2FA challenge.
+                    await self.hass.async_add_executor_job(
+                        partial(self.api.authenticate, force_refresh=True)
+                    )
+            except (PyiCloudException, requests.exceptions.RequestException) as error:
                 self.api = None
                 if is_transient_error(error):
                     _LOGGER.warning("iCloud temporarily unreachable: %s", error)
@@ -269,10 +278,24 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
             )
             if not devices:
                 raise PyiCloudNoDevicesException  # noqa: TRY301
-        except (PyiCloudServiceNotActivatedException, PyiCloudNoDevicesException):
+        except (
+            PyiCloudServiceNotActivatedException,
+            PyiCloudNoDevicesException,
+            PyiCloudServiceUnavailable,
+        ):
             _LOGGER.error("No device found in the iCloud account: %s", self._username)
             self.api = None
             return self.async_abort(reason="no_device")
+        except (PyiCloudException, requests.exceptions.RequestException) as error:
+            _LOGGER.warning("iCloud temporarily unreachable: %s", error)
+            return self._show_setup_form(user_input, {"base": "cannot_connect"}, step_id)
+
+        # The device list was only needed to check the account: stop pyicloud's
+        # background refresh so this session does not keep rewriting the
+        # session files used by the config entry.
+        stop_event = getattr(devices, "stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
 
         data = {
             CONF_USERNAME: self._username,

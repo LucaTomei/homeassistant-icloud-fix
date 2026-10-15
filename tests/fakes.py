@@ -19,6 +19,10 @@ class FakeICloud:
     token_login_trusts = True
     session_data = {"session_token": "tok", "trust_token": "trust"}
     init_error: Exception | None = None
+    # True when a saved session token is still accepted: pyicloud then skips the
+    # password sign-in and has no 2FA challenge to send a code for.
+    no_2fa_challenge = False
+    devices_error: Exception | None = None
 
     def __init__(self, username, password, cookie_directory=None, **kwargs):
         if FakeICloud.init_error is not None:
@@ -33,7 +37,8 @@ class FakeICloud:
         self._request_sms_2fa_code = MagicMock(side_effect=self._request_sms)
         self.validate_2fa_code = MagicMock(side_effect=self._validate)
         self.trust_session = MagicMock(return_value=True)
-        self.authenticate = MagicMock()
+        self._auth_data = {} if FakeICloud.no_2fa_challenge else {"mode": "sms"}
+        self.authenticate = MagicMock(side_effect=self._authenticate)
         device = MagicMock()
         device.status.return_value = {
             "id": "dev1",
@@ -54,7 +59,15 @@ class FakeICloud:
         devices.__getitem__ = lambda s, i: device
         devices.__bool__ = lambda s: True
         devices.user_info = {"firstName": "Luca", "lastName": "T", "membersInfo": None}
-        self.devices = devices
+        self._fmip = devices
+        self._devices = None
+
+    @property
+    def devices(self):
+        if FakeICloud.devices_error is not None:
+            raise FakeICloud.devices_error
+        self._devices = self._fmip
+        return self._fmip
 
     @property
     def requires_2fa(self):
@@ -65,7 +78,14 @@ class FakeICloud:
             raise PyiCloud2FARequiredException("x", None)
         self.is_trusted_session = True
 
+    def _authenticate(self, force_refresh=False, service=None):
+        if force_refresh:
+            # Password sign-in: Apple starts a 2FA challenge.
+            self._auth_data = {"mode": "sms"}
+
     def _request_code(self):
+        if not self._auth_data:
+            return False
         self.two_factor_delivery_method = "trusted_device"
         return True
 
@@ -87,3 +107,5 @@ class FakeICloud:
         cls.token_login_trusts = True
         cls.session_data = {"session_token": "tok", "trust_token": "trust"}
         cls.init_error = None
+        cls.no_2fa_challenge = False
+        cls.devices_error = None

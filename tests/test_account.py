@@ -56,6 +56,23 @@ def test_transient_detection():
     assert is_transient_error(PyiCloudAPIResponseException("slow down", "429"))
     assert not is_transient_error(PyiCloudFailedLoginException("Invalid email/password combination."))
     assert not is_transient_error(PyiCloudAPIResponseException("bad", 401))
+    assert is_transient_error(requests.exceptions.JSONDecodeError("html", "<html>", 0))
+
+
+def test_wrong_password_after_network_error_is_not_transient():
+    """pyicloud signs in with the password while handling a token error."""
+    try:
+        try:
+            raise _network_login_error()
+        except PyiCloudFailedLoginException:
+            try:
+                raise PyiCloudAPIResponseException("Unauthorized", 401)
+            except PyiCloudAPIResponseException as err:
+                raise PyiCloudFailedLoginException(
+                    "Invalid email/password combination."
+                ) from err
+    except PyiCloudFailedLoginException as err:
+        assert not is_transient_error(err)
 
 
 async def _setup(hass: HomeAssistant):
@@ -114,3 +131,61 @@ async def test_keep_alive_network_error_keeps_polling(hass, fake_icloud):
     sched.assert_called_once()
     assert account._fetch_interval == 5
     assert not _reauth_flows(hass)
+
+
+async def test_find_my_network_error_at_boot_retries(hass, fake_icloud):
+    """Login works but Find My is not reachable yet: retry, no password."""
+    fake_icloud.devices_error = _network_login_error().__cause__
+    entry = await _setup(hass)
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert not _reauth_flows(hass)
+
+
+async def test_keep_alive_unexpected_error_keeps_polling(hass, fake_icloud):
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    account.api.authenticate.side_effect = ValueError("unexpected html")
+    with patch.object(account, "_schedule_next_fetch") as sched:
+        await hass.async_add_executor_job(account.keep_alive)
+    sched.assert_called_once()
+    assert not _reauth_flows(hass)
+
+
+async def test_keep_alive_refreshes_locations(hass, fake_icloud):
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    devices = account.api.devices
+    devices.refresh.assert_not_called()  # just fetched at setup
+    with patch.object(account, "_schedule_next_fetch"):
+        await hass.async_add_executor_job(account.keep_alive)
+    devices.refresh.assert_called_once_with(locate=True)
+
+
+async def test_unload_stops_polling_and_session(hass, fake_icloud):
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    devices = account.api._devices
+    assert account._unsub_fetch is not None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert account._unsub_fetch is None
+    assert account.api is None
+    devices.stop_event.set.assert_called()
+    # A late timer or service call does nothing after unload.
+    await hass.async_add_executor_job(account.keep_alive)
+    assert account.api is None
+    assert len(fake_icloud.instances) == 1
+
+
+async def test_reauth_releases_old_session(hass, fake_icloud):
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    devices = account.api._devices
+    account.api._requires_mfa = True
+    fake_icloud.token_login_trusts = False
+    with patch.object(account, "_schedule_next_fetch"):
+        await hass.async_add_executor_job(account.keep_alive)
+    await hass.async_block_till_done()
+    assert len(_reauth_flows(hass)) == 1
+    assert account.api is None
+    devices.stop_event.set.assert_called()

@@ -73,6 +73,24 @@ async def test_wrong_then_right_code_reuses_session(hass):
     await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
     # only one login during the whole flow (+1 when the entry is loaded)
-    flow_logins = [i for i in FakeICloud.instances[:2]]
     assert FakeICloud.instances[0].validate_2fa_code.call_count == 2
     assert len(FakeICloud.instances) <= 2, f"created {len(FakeICloud.instances)} sessions"
+
+
+async def test_saved_token_without_trust_still_sends_code(hass):
+    """The saved token is accepted but untrusted: a real code must be sent."""
+    FakeICloud.no_2fa_challenge = True
+    result = await _to_code_form(hass)
+    api = FakeICloud.instances[0]
+    api.authenticate.assert_called_once_with(force_refresh=True)
+    assert not result["errors"]
+    assert api.request_2fa_code.call_count == 1
+
+
+async def test_flow_stops_its_background_refresh(hass):
+    result = await _to_code_form(hass)
+    api = FakeICloud.instances[0]
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"verification_code": "123456"})
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    api.devices.stop_event.set.assert_called()

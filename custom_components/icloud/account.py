@@ -3,11 +3,11 @@
 from datetime import timedelta
 import logging
 import operator
+import threading
 from typing import Any
 
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import (
-    PyiCloud2FARequiredException,
     PyiCloudAPIResponseException,
     PyiCloudException,
     PyiCloudFailedLoginException,
@@ -82,6 +82,8 @@ def is_transient_error(err: BaseException | None) -> bool:
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
                 requests.exceptions.ChunkedEncodingError,
+                # Apple answered with an HTML page (maintenance, captive portal).
+                requests.exceptions.InvalidJSONError,
                 PyiCloudServiceUnavailable,
             ),
         ):
@@ -90,8 +92,13 @@ def is_transient_error(err: BaseException | None) -> bool:
             code = err.code
             if isinstance(code, str) and code.isdigit():
                 code = int(code)
-            if isinstance(code, int) and (code >= 500 or code == 429):
-                return True
+            if isinstance(code, int):
+                if code >= 500 or code == 429:
+                    return True
+                if 400 <= code < 500:
+                    # A definitive answer from Apple (e.g. wrong password):
+                    # do not look at older errors raised while handling it.
+                    return False
         err = err.__cause__ or err.__context__
     return False
 
@@ -130,6 +137,9 @@ class IcloudAccount:
         self._retried_fetch = False
         self._config_entry = config_entry
         self._reauth_pending = False
+        self._shutdown = False
+        self._unsub_fetch: CALLBACK_TYPE | None = None
+        self._fetch_lock = threading.Lock()
 
         self.listeners: list[CALLBACK_TYPE] = []
 
@@ -155,11 +165,10 @@ class IcloudAccount:
                 raise PyiCloudFailedLoginException("2FA Required")  # noqa: TRY301
 
         except PyiCloudFailedLoginException as err:
+            self._release_api()
             if is_transient_error(err):
-                self.api = None
                 self._handle_transient_error(err, raise_not_ready)
                 return
-            self.api = None
             # Login failed which means credentials need to be updated.
             _LOGGER.error(
                 (
@@ -172,8 +181,12 @@ class IcloudAccount:
 
             self._require_reauth()
             return
-        except (PyiCloudAPIResponseException, PyiCloudServiceUnavailable) as err:
-            self.api = None
+        except (
+            PyiCloudAPIResponseException,
+            PyiCloudServiceUnavailable,
+            requests.exceptions.RequestException,
+        ) as err:
+            self._release_api()
             if is_transient_error(err):
                 self._handle_transient_error(err, raise_not_ready)
                 return
@@ -184,16 +197,25 @@ class IcloudAccount:
         try:
             # Gets device owners infos
             user_info = self.api.devices.user_info
-        except (
-            PyiCloudServiceNotActivatedException,
-            PyiCloudNoDevicesException,
-            PyiCloudServiceUnavailable,
-        ) as err:
-            _LOGGER.error("No iCloud device found")
-            raise ConfigEntryNotReady from err
-
-        if user_info is None:
-            raise ConfigEntryNotReady("No user info found in iCloud devices response")
+            if user_info is None:
+                raise PyiCloudNoDevicesException(  # noqa: TRY301
+                    "No user info found in iCloud devices response"
+                )
+        except (PyiCloudException, requests.exceptions.RequestException) as err:
+            # Find My not reachable yet (network, Apple outage) or no device:
+            # retry later, never ask to re-authenticate for this.
+            self._release_api()
+            if isinstance(
+                err,
+                (
+                    PyiCloudServiceNotActivatedException,
+                    PyiCloudNoDevicesException,
+                    PyiCloudServiceUnavailable,
+                ),
+            ):
+                _LOGGER.error("No iCloud device found: %s", err)
+            self._handle_transient_error(err, raise_not_ready)
+            return
 
         self._owner_fullname = (
             f"{user_info.get('firstName')} {user_info.get('lastName')}"
@@ -207,9 +229,10 @@ class IcloudAccount:
                 )
 
         self._devices = {}
-        self.update_devices()
+        # The device list was just fetched (and located) by pyicloud.
+        self.update_devices(refresh=False)
 
-    def update_devices(self) -> None:
+    def update_devices(self, refresh: bool = True) -> None:
         """Update iCloud devices."""
         if self.api is None:
             return
@@ -228,6 +251,11 @@ class IcloudAccount:
         api_devices = {}
         try:
             api_devices = self.api.devices
+            if refresh:
+                # pyicloud 2.5 caches the device list and refreshes it in the
+                # background without locating the devices: ask Apple for fresh
+                # locations, like the built-in integration does.
+                api_devices.refresh(locate=True)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Unknown iCloud error: %s", err)
             self._fetch_interval = 2
@@ -283,7 +311,28 @@ class IcloudAccount:
     def _require_reauth(self):
         """Require the user to log in again."""
         self._reauth_pending = True
+        # Stop using the old session: it must not overwrite the session files
+        # while the re-authentication flow saves the new trusted session.
+        self._release_api()
         self.hass.add_job(self._config_entry.async_start_reauth, self.hass)
+
+    def _release_api(self) -> None:
+        """Drop the pyicloud session and stop its background refresh thread."""
+        api, self.api = self.api, None
+        if api is None:
+            return
+        # Use the private attribute: the public "devices" property would log in
+        # to Find My again only to stop it.
+        stop_event = getattr(getattr(api, "_devices", None), "stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+
+    def shutdown(self) -> None:
+        """Stop polling and release the iCloud session (run in the executor)."""
+        with self._fetch_lock:
+            self._shutdown = True
+            self._cancel_next_fetch()
+        self._release_api()
 
     def _try_restore_session(self) -> bool:
         """Try to restore a trusted session without asking for a new 2FA code.
@@ -310,11 +359,7 @@ class IcloudAccount:
 
         try:
             authenticate_with_token()
-        except (
-            PyiCloud2FARequiredException,
-            PyiCloudFailedLoginException,
-            PyiCloudAPIResponseException,
-        ) as err:
+        except PyiCloudException as err:
             if is_transient_error(err):
                 # Network / Apple-side problem: let the caller retry later
                 # instead of asking the user for a new code.
@@ -422,15 +467,36 @@ class IcloudAccount:
         )
 
     def _schedule_next_fetch(self) -> None:
-        if not self._config_entry.pref_disable_polling:
-            track_point_in_utc_time(
+        with self._fetch_lock:
+            # Only one pending update at a time (the "update" service and the
+            # polling loop may both schedule one).
+            self._cancel_next_fetch()
+            if self._shutdown or self._config_entry.pref_disable_polling:
+                return
+            self._unsub_fetch = track_point_in_utc_time(
                 self.hass,
                 self.keep_alive,
                 utcnow() + timedelta(minutes=self._fetch_interval),
             )
 
+    def _cancel_next_fetch(self) -> None:
+        if self._unsub_fetch is not None:
+            self._unsub_fetch()
+            self._unsub_fetch = None
+
     def keep_alive(self, now=None) -> None:
         """Keep the API alive."""
+        if self._shutdown:
+            return
+        try:
+            self._keep_alive()
+        except Exception as err:  # noqa: BLE001
+            # Never let the polling loop die (unexpected Apple responses,
+            # pyicloud errors...): log it and try again later.
+            _LOGGER.exception("Unexpected error while updating iCloud")
+            self._handle_transient_error(err, raise_not_ready=False)
+
+    def _keep_alive(self) -> None:
         if self.api is None:
             if self._reauth_pending:
                 # Waiting for the user to re-authenticate: do not keep logging
@@ -439,6 +505,9 @@ class IcloudAccount:
             self.setup(raise_not_ready=False)
 
         if self.api is None:
+            return
+        if self._shutdown:
+            self._release_api()
             return
 
         try:
