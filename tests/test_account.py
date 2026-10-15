@@ -381,3 +381,17 @@ async def test_skipped_device_follows_new_session(hass, fake_icloud):
         await hass.async_add_executor_job(account.keep_alive)
     assert account.devices["dev1"] is device
     assert device.device is not old_object
+
+
+async def test_battery_only_in_battery_sensor(hass, fake_icloud):
+    """The tracker no longer has a battery attribute (deprecated by HA)."""
+    fake_icloud.location = {
+        "latitude": 45.0,
+        "longitude": 9.0,
+        "horizontalAccuracy": 10,
+    }
+    await _setup(hass)
+    [tracker] = hass.states.async_all("device_tracker")
+    assert "battery_level" not in tracker.attributes
+    [battery] = hass.states.async_all("sensor")
+    assert battery.state == "50"

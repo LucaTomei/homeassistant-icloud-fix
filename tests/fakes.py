@@ -25,6 +25,7 @@ class FakeICloud:
     devices_error: Exception | None = None
     code_request_fails = False
     unknown_battery = False
+    location = None
 
     def __init__(self, username, password, cookie_directory=None, **kwargs):
         if FakeICloud.init_error is not None:
@@ -53,7 +54,7 @@ class FakeICloud:
             "prsId": None,
             "lostModeCapable": True,
             "lowPowerMode": False,
-            "location": None,
+            "location": FakeICloud.location,
             "deviceClass": "iPhone",
         }
         devices = MagicMock()
@@ -113,3 +114,4 @@ class FakeICloud:
         cls.devices_error = None
         cls.code_request_fails = False
         cls.unknown_battery = False
+        cls.location = None

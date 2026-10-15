@@ -46,6 +46,9 @@ a new 2FA code (also by SMS) without starting over.
 | **Frozen positions after a reconnection** | Entities kept the old device objects and stopped updating | Entities keep updating after a new session |
 | **Empty code submitted** | Generic error | Clear message |
 
+> [!NOTE]
+> The battery is no longer an attribute of the device tracker, use the battery sensor.
+
 Also included:
 
 - The code form shows where Apple sent the code (Apple devices or SMS).

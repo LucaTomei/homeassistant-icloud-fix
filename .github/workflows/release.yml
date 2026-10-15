@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history and tags, to list the commits since the previous tag.
+          fetch-depth: 0
 
       - name: Check that the tag matches manifest.json
         run: |
@@ -33,9 +36,22 @@ jobs:
           cd custom_components/icloud
           zip -r "$GITHUB_WORKSPACE/icloud.zip" . -x "__pycache__/*"
 
+      - name: Write release notes from the commits
+        run: |
+          PREVIOUS=$(git describe --tags --abbrev=0 --match 'v*.*.*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          if [ -n "$PREVIOUS" ]; then
+            RANGE="$PREVIOUS..$GITHUB_REF_NAME"
+          else
+            RANGE="$GITHUB_REF_NAME"
+          fi
+          echo "Commits in $RANGE"
+          git log --pretty='- %s' "$RANGE" > notes.md
+          cat notes.md
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
+          body_path: notes.md
           generate_release_notes: true
           files: icloud.zip
