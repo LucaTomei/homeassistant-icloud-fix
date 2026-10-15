@@ -9,9 +9,9 @@
   ],
   "config_flow": true,
   "documentation": "https://github.com/LucaTomei/homeassistant-icloud-fix",
-  "issue_tracker": "https://github.com/LucaTomei/homeassistant-icloud-fix/issues",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/LucaTomei/homeassistant-icloud-fix/issues",
   "loggers": [
     "keyrings.alt",
     "pyicloud"
