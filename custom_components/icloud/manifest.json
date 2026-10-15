@@ -1,0 +1,23 @@
+{
+  "domain": "icloud",
+  "name": "Apple iCloud",
+  "codeowners": [
+    "@LucaTomei",
+    "@mdeuerlein",
+    "@Quentame",
+    "@nzapponi"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/LucaTomei/homeassistant-icloud-fix",
+  "issue_tracker": "https://github.com/LucaTomei/homeassistant-icloud-fix/issues",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "loggers": [
+    "keyrings.alt",
+    "pyicloud"
+  ],
+  "requirements": [
+    "pyicloud==2.5.0"
+  ],
+  "version": "0.3.0"
+}
