@@ -108,6 +108,16 @@
             },
             "name": "Ton abspielen"
         },
+        "reset_session": {
+            "description": "Löscht die gespeicherte iCloud-Sitzung eines Accounts und fordert eine erneute Anmeldung an. Nur verwenden, wenn die Integration hängt: Ein neuer Bestätigungscode wird benötigt.",
+            "fields": {
+                "account": {
+                    "description": "Dein Apple-Account-Benutzername/deine E-Mail.",
+                    "name": "Account"
+                }
+            },
+            "name": "Sitzung zurücksetzen"
+        },
         "update": {
             "description": "Fordert eine Statusaktualisierung aller mit einem Apple-Account verknüpften Geräte an.",
             "fields": {

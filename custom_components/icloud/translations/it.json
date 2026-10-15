@@ -108,6 +108,16 @@
       },
       "name": "Riproduci suono"
     },
+    "reset_session": {
+      "description": "Cancella la sessione iCloud salvata di un account e chiede di accedere di nuovo. Usalo solo se l'integrazione è bloccata: servirà un nuovo codice di verifica.",
+      "fields": {
+        "account": {
+          "description": "Il nome utente/email del tuo account Apple.",
+          "name": "Account"
+        }
+      },
+      "name": "Reimposta sessione"
+    },
     "update": {
       "description": "Chiede l'aggiornamento della posizione di tutti i dispositivi di un account Apple.",
       "fields": {

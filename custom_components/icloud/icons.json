@@ -9,6 +9,9 @@
     "play_sound": {
       "service": "mdi:speaker-wireless"
     },
+    "reset_session": {
+      "service": "mdi:restore-alert"
+    },
     "update": {
       "service": "mdi:update"
     }

@@ -18,6 +18,9 @@ DEFAULT_GPS_ACCURACY_THRESHOLD = 500  # meters
 STORAGE_KEY = DOMAIN
 STORAGE_VERSION = 2
 
+# Fired when the user must enter the password / a new code again.
+EVENT_REAUTH_REQUIRED = f"{DOMAIN}_reauth_required"
+
 PLATFORMS = [Platform.DEVICE_TRACKER, Platform.SENSOR]
 
 # pyicloud.AppleDevice status

@@ -1,8 +1,11 @@
 """iCloud account."""
 
 from datetime import timedelta
+import functools
 import logging
 import operator
+import os
+import re
 import threading
 from typing import Any
 
@@ -17,14 +20,16 @@ from pyicloud.exceptions import (
 )
 import requests
 from pyicloud.services.findmyiphone import AppleDevice
+from pyicloud.session import PyiCloudSession
 
 from homeassistant.components.zone import async_active_zone
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_USERNAME
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.dispatcher import dispatcher_send
 from homeassistant.helpers.event import track_point_in_utc_time
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
 from homeassistant.util import slugify
 from homeassistant.util.async_ import run_callback_threadsafe
@@ -32,6 +37,7 @@ from homeassistant.util.dt import utcnow
 from homeassistant.util.location import distance
 
 from .const import (
+    ATTR_ACCOUNT,
     ATTR_ACCOUNT_FETCH_INTERVAL,
     ATTR_BATTERY,
     ATTR_BATTERY_STATUS,
@@ -57,12 +63,39 @@ from .const import (
     DEVICE_STATUS_CODES,
     DEVICE_STATUS_SET,
     DOMAIN,
+    EVENT_REAUTH_REQUIRED,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 # Minutes to wait before retrying after a temporary (network / Apple-side) error.
 RETRY_AFTER_TRANSIENT_ERROR = 5
+# Failed device updates in a row before opening a new session.
+MAX_FAILED_UPDATES = 3
+# (connect, read) timeout in seconds for iCloud requests.
+REQUEST_TIMEOUT = (10, 60)
+
+
+def _with_default_timeout(method):
+    """Give a pyicloud request a timeout when it has none."""
+
+    @functools.wraps(method)
+    def request(self, *args, timeout=None, **kwargs):
+        if timeout is None:
+            timeout = REQUEST_TIMEOUT
+        return method(self, *args, timeout=timeout, **kwargs)
+
+    request.icloud_default_timeout = True
+    return request
+
+
+# pyicloud never sets a timeout: a stalled connection to Apple would block the
+# setup or the polling loop forever instead of being retried later.
+for _name in ("request", "request_raw"):
+    if not getattr(getattr(PyiCloudSession, _name), "icloud_default_timeout", False):
+        setattr(
+            PyiCloudSession, _name, _with_default_timeout(getattr(PyiCloudSession, _name))
+        )
 
 
 def is_transient_error(err: BaseException | None) -> bool:
@@ -102,6 +135,44 @@ def is_transient_error(err: BaseException | None) -> bool:
         err = err.__cause__ or err.__context__
     return False
 
+
+def apple_status_code(err: BaseException | None) -> int | None:
+    """Return the first numeric status code Apple answered with, if any."""
+    seen: set[int] = set()
+    while err is not None and id(err) not in seen:
+        seen.add(id(err))
+        if isinstance(err, PyiCloudAPIResponseException):
+            code = err.code
+            if isinstance(code, str) and code.isdigit():
+                code = int(code)
+            if isinstance(code, int):
+                return code
+        err = err.__cause__ or err.__context__
+    return None
+
+
+def is_wrong_password(err: BaseException | None) -> bool:
+    """Return True if Apple rejected the Apple ID or the password (HTTP 401)."""
+    return apple_status_code(err) == 401
+
+
+def reset_session_files(cookie_directory: str, username: str) -> None:
+    """Delete the saved iCloud session of one account, like a fresh install.
+
+    Same file names as pyicloud (PyiCloudSession.session_path/cookiejar_path).
+    """
+    name = re.sub(r"\W", "", username)
+    for suffix in (".session", ".cookiejar"):
+        path = os.path.join(cookie_directory, name + suffix)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        except OSError as err:
+            _LOGGER.error("Could not delete the iCloud session file %s: %s", path, err)
+    _LOGGER.warning("Saved iCloud session of %s deleted", username)
+
+
 type IcloudConfigEntry = ConfigEntry[IcloudAccount]
 
 
@@ -135,11 +206,15 @@ class IcloudAccount:
         self._family_members_fullname: dict[str, str] = {}
         self._devices: dict[str, IcloudDevice] = {}
         self._retried_fetch = False
+        self._failed_updates = 0
         self._config_entry = config_entry
         self._reauth_pending = False
         self._shutdown = False
         self._unsub_fetch: CALLBACK_TYPE | None = None
         self._fetch_lock = threading.Lock()
+        # Held while the session is used (updates) or replaced (reset,
+        # shutdown), so a reset never runs in the middle of an update.
+        self._api_lock = threading.RLock()
 
         self.listeners: list[CALLBACK_TYPE] = []
 
@@ -228,7 +303,8 @@ class IcloudAccount:
                     f"{member['firstName']} {member['lastName']}"
                 )
 
-        self._devices = {}
+        # Existing devices are kept (and updated) so that entities created
+        # before a new session keep receiving updates.
         # The device list was just fetched (and located) by pyicloud.
         self.update_devices(refresh=False)
 
@@ -258,6 +334,16 @@ class IcloudAccount:
                 api_devices.refresh(locate=True)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Unknown iCloud error: %s", err)
+            self._failed_updates += 1
+            if self._failed_updates >= MAX_FAILED_UPDATES:
+                # The session looks stuck: open a new one (from the saved
+                # trust token, no new code needed) on the next update.
+                _LOGGER.warning(
+                    "iCloud updates keep failing, opening a new session for %s",
+                    self._username,
+                )
+                self._failed_updates = 0
+                self._release_api()
             self._fetch_interval = 2
             dispatcher_send(self.hass, self.signal_device_update)
             self._schedule_next_fetch()
@@ -269,6 +355,10 @@ class IcloudAccount:
             status = device.status(DEVICE_STATUS_SET)
             device_id = status[DEVICE_ID]
             device_name = status[DEVICE_NAME]
+
+            if (known_device := self._devices.get(device_id)) is not None:
+                # A new session gives new device objects (used by the services).
+                known_device.set_device(device)
 
             if (
                 status[DEVICE_BATTERY_STATUS] == "Unknown"
@@ -291,6 +381,7 @@ class IcloudAccount:
                 self._devices[device_id].update(status)
                 new_device = True
 
+        self._failed_updates = 0
         if (
             DEVICE_STATUS_CODES.get(list(api_devices)[0][DEVICE_STATUS]) == "pending"
             and not self._retried_fetch
@@ -310,11 +401,26 @@ class IcloudAccount:
 
     def _require_reauth(self):
         """Require the user to log in again."""
+        if not self._reauth_pending:
+            self.hass.add_job(self._async_fire_reauth_required)
         self._reauth_pending = True
         # Stop using the old session: it must not overwrite the session files
         # while the re-authentication flow saves the new trusted session.
         self._release_api()
         self.hass.add_job(self._config_entry.async_start_reauth, self.hass)
+
+    @callback
+    def _async_fire_reauth_required(self) -> None:
+        """Let automations notify the user (e.g. on the phone).
+
+        At boot automations are only listening once Home Assistant has started.
+        """
+
+        @callback
+        def _fire(hass: HomeAssistant) -> None:
+            hass.bus.async_fire(EVENT_REAUTH_REQUIRED, {ATTR_ACCOUNT: self._username})
+
+        async_at_started(self.hass, _fire)
 
     def _release_api(self) -> None:
         """Drop the pyicloud session and stop its background refresh thread."""
@@ -327,12 +433,26 @@ class IcloudAccount:
         if stop_event is not None:
             stop_event.set()
 
+    def reset_session(self) -> None:
+        """Delete the saved session and ask the user to sign in again.
+
+        Same as removing the files in .storage/icloud by hand, for when the
+        session got stuck. Runs in the executor.
+        """
+        with self._api_lock:
+            with self._fetch_lock:
+                self._cancel_next_fetch()
+            self._release_api()
+            reset_session_files(self._icloud_dir.path, self._username)
+            self._require_reauth()
+
     def shutdown(self) -> None:
         """Stop polling and release the iCloud session (run in the executor)."""
-        with self._fetch_lock:
-            self._shutdown = True
-            self._cancel_next_fetch()
-        self._release_api()
+        with self._api_lock:
+            with self._fetch_lock:
+                self._shutdown = True
+                self._cancel_next_fetch()
+            self._release_api()
 
     def _try_restore_session(self) -> bool:
         """Try to restore a trusted session without asking for a new 2FA code.
@@ -486,15 +606,16 @@ class IcloudAccount:
 
     def keep_alive(self, now=None) -> None:
         """Keep the API alive."""
-        if self._shutdown:
-            return
-        try:
-            self._keep_alive()
-        except Exception as err:  # noqa: BLE001
-            # Never let the polling loop die (unexpected Apple responses,
-            # pyicloud errors...): log it and try again later.
-            _LOGGER.exception("Unexpected error while updating iCloud")
-            self._handle_transient_error(err, raise_not_ready=False)
+        with self._api_lock:
+            if self._shutdown:
+                return
+            try:
+                self._keep_alive()
+            except Exception as err:
+                # Never let the polling loop die (unexpected Apple responses,
+                # pyicloud errors...): log it and try again later.
+                _LOGGER.exception("Unexpected error while updating iCloud")
+                self._handle_transient_error(err, raise_not_ready=False)
 
     def _keep_alive(self) -> None:
         if self.api is None:
@@ -608,6 +729,10 @@ class IcloudDevice:
             ]
         elif account.owner_fullname is not None:
             self._attrs[ATTR_OWNER_NAME] = account.owner_fullname
+
+    def set_device(self, device: AppleDevice) -> None:
+        """Use the device object of the current iCloud session."""
+        self._device = device
 
     def update(self, status) -> None:
         """Update the iCloud device."""

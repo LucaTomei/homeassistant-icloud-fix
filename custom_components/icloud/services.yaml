@@ -62,3 +62,11 @@ lost_device:
       example: "Call me"
       selector:
         text:
+
+reset_session:
+  fields:
+    account:
+      required: true
+      example: "steve@apple.com"
+      selector:
+        text:

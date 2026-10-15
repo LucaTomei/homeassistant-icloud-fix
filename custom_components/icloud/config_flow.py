@@ -21,7 +21,12 @@ from homeassistant.config_entries import SOURCE_USER, ConfigFlow, ConfigFlowResu
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers.storage import Store
 
-from .account import is_transient_error
+from .account import (
+    apple_status_code,
+    is_transient_error,
+    is_wrong_password,
+    reset_session_files,
+)
 from .const import (
     CONF_GPS_ACCURACY_THRESHOLD,
     CONF_MAX_INTERVAL,
@@ -98,6 +103,8 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
         # session is reused instead of logging in again from scratch.
         self._verified: bool = False
         self._status_key: str | None = None
+        # The saved session is deleted at most once per flow.
+        self._session_reset: bool = False
 
     def _show_setup_form(self, user_input=None, errors=None, step_id="user"):
         """Show the setup form to the user."""
@@ -146,6 +153,54 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
                 with_family=self._with_family,
                 accept_terms=True,
             )
+        )
+
+    async def _login(self) -> dict[str, str]:
+        """Sign in to iCloud and return the form errors (empty when signed in).
+
+        If the saved session is stuck, it is deleted and the sign-in is tried
+        once more from scratch, like a fresh install. A wrong password or Apple
+        limiting the sign-ins never deletes it.
+        """
+        while True:
+            try:
+                self.api = await self._create_icloud_api()
+                if self.api.requires_2fa and not getattr(self.api, "_auth_data", None):
+                    # A saved session token was still accepted, so pyicloud did
+                    # not sign in with the password and has no 2FA challenge:
+                    # Apple would never send a code. Sign in with the password
+                    # to start a real 2FA challenge.
+                    await self.hass.async_add_executor_job(
+                        partial(self.api.authenticate, force_refresh=True)
+                    )
+            except (PyiCloudException, requests.exceptions.RequestException) as error:
+                self.api = None
+                if is_transient_error(error):
+                    _LOGGER.warning("iCloud temporarily unreachable: %s", error)
+                    return {"base": "cannot_connect"}
+                if apple_status_code(error) == 403:
+                    # Too many attempts or account locked: signing in again
+                    # right away would only make it worse.
+                    _LOGGER.error("Apple refused the iCloud sign-in: %s", error)
+                    return {"base": "cannot_connect"}
+                if self._session_reset or is_wrong_password(error):
+                    _LOGGER.error("Error logging into iCloud service: %s", error)
+                    return {CONF_PASSWORD: "invalid_auth"}
+                _LOGGER.warning(
+                    "iCloud sign-in failed (%s), retrying with a new session", error
+                )
+                await self._reset_saved_session()
+                continue
+            return {}
+
+    async def _reset_saved_session(self) -> None:
+        """Delete the saved session of this account (once per flow)."""
+        self._session_reset = True
+        self.api = None
+        await self.hass.async_add_executor_job(
+            reset_session_files,
+            Store(self.hass, STORAGE_VERSION, STORAGE_KEY).path,
+            self._username,
         )
 
     async def _request_2fa_code_if_supported(
@@ -245,29 +300,25 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
         if not (self._verified and self.api is not None):
-            try:
-                self.api = await self._create_icloud_api()
-                if self.api.requires_2fa and not getattr(self.api, "_auth_data", None):
-                    # A saved session token was still accepted, so pyicloud did
-                    # not sign in with the password and has no 2FA challenge:
-                    # Apple would never send a code. Sign in with the password
-                    # to start a real 2FA challenge.
-                    await self.hass.async_add_executor_job(
-                        partial(self.api.authenticate, force_refresh=True)
-                    )
-            except (PyiCloudException, requests.exceptions.RequestException) as error:
-                self.api = None
-                if is_transient_error(error):
-                    _LOGGER.warning("iCloud temporarily unreachable: %s", error)
-                    errors = {"base": "cannot_connect"}
-                else:
-                    _LOGGER.error("Error logging into iCloud service: %s", error)
-                    errors = {CONF_PASSWORD: "invalid_auth"}
+            if errors := await self._login():
                 return self._show_setup_form(user_input, errors, step_id)
 
         if self.api.requires_2fa:
             self._2fa_code_requested = False
-            return await self.async_step_verification_code(request_code=True)
+            errors = await self._request_2fa_code_if_supported()
+            if errors.get("base") != "send_verification_code" or self._session_reset:
+                return await self._show_verification_code_form(errors)
+            # Apple did not send a code: the saved session may be stuck.
+            # Start once more from a new session.
+            _LOGGER.warning("No iCloud code could be requested, retrying with a new session")
+            await self._reset_saved_session()
+            if errors := await self._login():
+                return self._show_setup_form(user_input, errors, step_id)
+            if self.api.requires_2fa:
+                self._2fa_code_requested = False
+                return await self._show_verification_code_form(
+                    await self._request_2fa_code_if_supported()
+                )
 
         if self.api.requires_2sa:
             return await self.async_step_trusted_device()

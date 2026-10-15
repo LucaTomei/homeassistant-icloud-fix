@@ -23,6 +23,8 @@ a new 2FA code (also by SMS) without starting over.
 - 🌐 **Resilient to network errors** at boot and while polling
 - 📲 **New 2FA code on demand**, on your Apple devices or by SMS
 - 🚦 **No login storms** while a re-authentication is pending
+- 🧹 **Self-healing session**: a stuck session is replaced automatically, or with one action
+- 🔔 **Event when a new code is needed**, to get a notification on your phone
 - 🌍 Translated into **English, Italian, German and French**
 
 ## 🛠️ What this version fixes
@@ -39,6 +41,9 @@ a new 2FA code (also by SMS) without starting over.
 | **Find My not reachable at startup** | Setup failed until the next restart | Setup is retried automatically |
 | **Old sessions left running** after a reload or a re-authentication | Background refreshes kept saving old tokens over the new trusted session | Old sessions are stopped, only the current one is saved |
 | **Stale locations** with pyicloud 2.5 | Positions came from a cache, Apple was never asked to locate the devices | Every update asks Apple for fresh locations |
+| **Session stuck after a long time** | Only way out: delete `.storage/icloud` by hand and restart | During sign-in the stuck session is replaced automatically, or use the `icloud.reset_session` action |
+| **Requests hanging forever** on a stalled connection | Setup or polling blocked until the next restart | Requests time out (10 s to connect, 60 s to answer) and are retried |
+| **Frozen positions after a reconnection** | Entities kept the old device objects and stopped updating | Entities keep updating after a new session |
 | **Empty code submitted** | Generic error | Clear message |
 
 Also included:
@@ -86,6 +91,49 @@ In the **Apple Account code** step:
    prefer a text message) and press **Submit** without entering a code.
 2. Enter the new code and press **Submit**.
 
+### If iCloud gets stuck
+
+There is no need to delete `/config/.storage/icloud` by hand anymore.
+
+- **Automatically**: when you sign in again, if the saved session makes the
+  sign-in fail or Apple does not send a code, the integration deletes the
+  saved session of that account and tries once more from scratch. A wrong
+  password never deletes it.
+- **By hand**: run the **Apple iCloud: Reset session** action
+  (Developer tools → Actions). It deletes the saved session of that account
+  only, then asks you to sign in again with a new code. It also works when
+  the integration could not start.
+
+```yaml
+action: icloud.reset_session
+data:
+  account: you@icloud.com
+```
+
+> [!WARNING]
+> Use it only when the integration is stuck: a working trusted session is
+> deleted too, so Apple will ask for a new code.
+
+### Notification when a new code is needed
+
+When Apple really needs a new code (for example after the trust expires),
+the integration fires the `icloud_reauth_required` event:
+
+```yaml
+automation:
+  - alias: "iCloud needs a new code"
+    triggers:
+      - trigger: event
+        event_type: icloud_reauth_required
+    actions:
+      - action: notify.mobile_app_your_phone
+        data:
+          title: "Apple iCloud"
+          message: >-
+            Sign in again for {{ trigger.event.data.account }}:
+            Settings → Devices & services → Apple iCloud.
+```
+
 ## 🐞 Troubleshooting
 
 Enable debug logs in `configuration.yaml`, restart and reproduce the problem:
@@ -105,8 +153,9 @@ with the relevant log lines (remove your Apple ID and any personal data).
 
 The `tests` folder simulates Apple's behaviour: restart with a trusted session,
 revoked trust, network errors at boot, in Find My and while polling, wrong
-password, re-authentication with an untrusted saved session, reload and
-unload, new code, SMS and session reuse.
+password, re-authentication with an untrusted saved session, stuck sessions,
+session reset, reload and unload, request timeouts, new code, SMS and session
+reuse.
 
 ```bash
 pip install -r requirements_test.txt
@@ -122,6 +171,11 @@ Versione corretta dell'integrazione Apple iCloud di Home Assistant:
 - ripristino automatico della sessione di fiducia;
 - aggiornamenti che ripartono da soli dopo un errore di rete;
 - pulsante **"Non ho ricevuto il codice: inviane uno nuovo"** (anche via SMS);
+- sessione bloccata sostituita da sola durante il nuovo accesso, oppure con
+  l'azione **Apple iCloud: Reimposta sessione** (niente più
+  `rm -rf /config/.storage/icloud/*`);
+- evento `icloud_reauth_required` per ricevere una notifica quando serve un
+  nuovo codice;
 - traduzione italiana.
 
 Installazione: HACS → ⋮ → **Custom repositories** → aggiungi

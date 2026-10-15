@@ -23,6 +23,8 @@ class FakeICloud:
     # password sign-in and has no 2FA challenge to send a code for.
     no_2fa_challenge = False
     devices_error: Exception | None = None
+    code_request_fails = False
+    unknown_battery = False
 
     def __init__(self, username, password, cookie_directory=None, **kwargs):
         if FakeICloud.init_error is not None:
@@ -44,7 +46,7 @@ class FakeICloud:
             "id": "dev1",
             "name": "iPhone",
             "deviceStatus": "200",
-            "batteryStatus": "Charging",
+            "batteryStatus": "Unknown" if FakeICloud.unknown_battery else "Charging",
             "batteryLevel": 0.5,
             "deviceDisplayName": "iPhone",
             "rawDeviceModel": "iPhone15,2",
@@ -84,7 +86,7 @@ class FakeICloud:
             self._auth_data = {"mode": "sms"}
 
     def _request_code(self):
-        if not self._auth_data:
+        if not self._auth_data or FakeICloud.code_request_fails:
             return False
         self.two_factor_delivery_method = "trusted_device"
         return True
@@ -109,3 +111,5 @@ class FakeICloud:
         cls.init_error = None
         cls.no_2fa_challenge = False
         cls.devices_error = None
+        cls.code_request_fails = False
+        cls.unknown_battery = False

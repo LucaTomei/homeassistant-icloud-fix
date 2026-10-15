@@ -4,6 +4,11 @@ from unittest.mock import patch
 
 import pytest
 
+from pyicloud.exceptions import (
+    PyiCloudAPIResponseException,
+    PyiCloudFailedLoginException,
+)
+
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResultType
 
@@ -94,3 +99,80 @@ async def test_flow_stops_its_background_refresh(hass):
     await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
     api.devices.stop_event.set.assert_called()
+
+
+def _login_error(code):
+    try:
+        raise PyiCloudAPIResponseException("error", code)
+    except PyiCloudAPIResponseException as err:
+        try:
+            raise PyiCloudFailedLoginException("Invalid email/password combination.") from err
+        except PyiCloudFailedLoginException as login_err:
+            return login_err
+
+
+async def _start(hass):
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": config_entries.SOURCE_USER})
+    return await hass.config_entries.flow.async_configure(result["flow_id"], USER)
+
+
+async def test_stuck_session_is_reset_once(hass):
+    """Sign-in fails because of the saved session: start from a clean one."""
+    FakeICloud.init_error = _login_error(421)
+
+    def clean(*args):
+        FakeICloud.init_error = None
+
+    with patch("custom_components.icloud.config_flow.reset_session_files", side_effect=clean) as reset:
+        result = await _start(hass)
+    reset.assert_called_once()
+    assert reset.call_args.args[1] == USER["username"]
+    assert result["step_id"] == "verification_code"
+    assert not result["errors"]
+
+
+async def test_wrong_password_never_resets_the_session(hass):
+    FakeICloud.init_error = _login_error(401)
+    with patch("custom_components.icloud.config_flow.reset_session_files") as reset:
+        result = await _start(hass)
+    reset.assert_not_called()
+    assert result["errors"] == {"password": "invalid_auth"}
+
+
+async def test_reset_only_once_per_flow(hass):
+    FakeICloud.init_error = _login_error(421)
+    with patch("custom_components.icloud.config_flow.reset_session_files") as reset:
+        result = await _start(hass)
+    reset.assert_called_once()
+    assert result["errors"] == {"password": "invalid_auth"}
+
+
+async def test_no_code_sent_resets_the_session(hass):
+    FakeICloud.code_request_fails = True
+
+    def clean(*args):
+        FakeICloud.code_request_fails = False
+
+    with patch("custom_components.icloud.config_flow.reset_session_files", side_effect=clean) as reset:
+        result = await _start(hass)
+    reset.assert_called_once()
+    assert result["step_id"] == "verification_code"
+    assert not result["errors"]
+    assert len(FakeICloud.instances) == 2
+
+
+async def test_no_code_after_reset_shows_error(hass):
+    FakeICloud.code_request_fails = True
+    with patch("custom_components.icloud.config_flow.reset_session_files") as reset:
+        result = await _start(hass)
+    reset.assert_called_once()
+    assert result["step_id"] == "verification_code"
+    assert result["errors"] == {"base": "send_verification_code"}
+
+
+async def test_apple_throttling_never_resets_the_session(hass):
+    FakeICloud.init_error = _login_error(403)
+    with patch("custom_components.icloud.config_flow.reset_session_files") as reset:
+        result = await _start(hass)
+    reset.assert_not_called()
+    assert result["errors"] == {"base": "cannot_connect"}

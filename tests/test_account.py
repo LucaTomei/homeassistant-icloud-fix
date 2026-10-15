@@ -1,6 +1,8 @@
 """Tests for session restore and transient error handling."""
 
-from unittest.mock import patch
+import asyncio
+import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -10,11 +12,20 @@ from pyicloud.exceptions import (
 )
 
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState, HomeAssistant
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_capture_events,
+)
 
-from custom_components.icloud.account import is_transient_error
-from custom_components.icloud.const import DOMAIN
+from custom_components.icloud.account import (
+    REQUEST_TIMEOUT,
+    is_transient_error,
+    is_wrong_password,
+    reset_session_files,
+)
+from custom_components.icloud.const import DOMAIN, EVENT_REAUTH_REQUIRED
 
 from .fakes import FakeICloud
 
@@ -189,3 +200,184 @@ async def test_reauth_releases_old_session(hass, fake_icloud):
     assert len(_reauth_flows(hass)) == 1
     assert account.api is None
     devices.stop_event.set.assert_called()
+
+
+def test_wrong_password_detection():
+    try:
+        try:
+            raise PyiCloudAPIResponseException("Unauthorized", 401)
+        except PyiCloudAPIResponseException as err:
+            raise PyiCloudFailedLoginException(
+                "Invalid email/password combination."
+            ) from err
+    except PyiCloudFailedLoginException as err:
+        assert is_wrong_password(err)
+    assert not is_wrong_password(_network_login_error())
+    assert not is_wrong_password(PyiCloudAPIResponseException("expired", 421))
+    assert not is_wrong_password(PyiCloudFailedLoginException("No session token"))
+
+
+def test_reset_session_files_only_touches_one_account(tmp_path):
+    for name in ("lucaexamplecom", "otherexamplecom"):
+        for suffix in (".session", ".cookiejar"):
+            (tmp_path / f"{name}{suffix}").write_text("x")
+    reset_session_files(str(tmp_path), "luca@example.com")
+    assert sorted(f.name for f in tmp_path.iterdir()) == [
+        "otherexamplecom.cookiejar",
+        "otherexamplecom.session",
+    ]
+    reset_session_files(str(tmp_path), "luca@example.com")  # nothing left: no error
+
+
+def test_requests_get_a_default_timeout():
+    from pyicloud.session import PyiCloudSession
+
+    session = MagicMock()
+    PyiCloudSession.request(session, "GET", "https://example.com")
+    assert session._request.call_args.kwargs["timeout"] == REQUEST_TIMEOUT
+    PyiCloudSession.request(session, "GET", "https://example.com", timeout=3)
+    assert session._request.call_args.kwargs["timeout"] == 3
+    PyiCloudSession.request_raw(session, "GET", "https://example.com")
+    assert session._request_raw.call_args.kwargs["timeout"] == REQUEST_TIMEOUT
+
+
+async def test_reauth_fires_event_once(hass, fake_icloud):
+    events = async_capture_events(hass, EVENT_REAUTH_REQUIRED)
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    account.api._requires_mfa = True
+    fake_icloud.token_login_trusts = False
+    with patch.object(account, "_schedule_next_fetch"):
+        await hass.async_add_executor_job(account.keep_alive)
+        await hass.async_add_executor_job(account.keep_alive)
+    await hass.async_block_till_done()
+    assert [e.data for e in events] == [{"account": DATA["username"]}]
+
+
+async def test_stuck_updates_open_a_new_session(hass, fake_icloud):
+    """Updates keep failing: a new session is opened, entities keep working."""
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    device = account.devices["dev1"]
+    first_api = account.api
+    first_api._fmip.refresh.side_effect = PyiCloudAPIResponseException("stuck", 450)
+    with patch.object(account, "_schedule_next_fetch"):
+        for _ in range(3):
+            await hass.async_add_executor_job(account.keep_alive)
+        assert account.api is None
+        first_api._fmip.stop_event.set.assert_called()
+        await hass.async_add_executor_job(account.keep_alive)
+    assert account.api is not None and account.api is not first_api
+    # Same device object (used by the entities), now bound to the new session.
+    assert account.devices["dev1"] is device
+    assert device.device is not None
+    assert not _reauth_flows(hass)
+
+
+async def test_reset_session_service(hass, fake_icloud):
+    events = async_capture_events(hass, EVENT_REAUTH_REQUIRED)
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    with patch("custom_components.icloud.account.reset_session_files") as reset:
+        await hass.services.async_call(
+            DOMAIN, "reset_session", {"account": DATA["username"]}, blocking=True
+        )
+        await hass.async_block_till_done()
+    reset.assert_called_once()
+    assert reset.call_args.args[1] == DATA["username"]
+    assert account.api is None
+    assert account._unsub_fetch is None
+    assert len(_reauth_flows(hass)) == 1
+    assert len(events) == 1
+
+
+async def test_reset_session_service_when_not_loaded(hass, fake_icloud):
+    fake_icloud.init_error = _network_login_error()
+    entry = await _setup(hass)
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    with patch("custom_components.icloud.services.reset_session_files") as reset:
+        await hass.services.async_call(
+            DOMAIN, "reset_session", {"account": DATA["username"]}, blocking=True
+        )
+        await hass.async_block_till_done()
+    reset.assert_called_once()
+    assert len(_reauth_flows(hass)) == 1
+
+
+def test_reset_session_files_never_raises(tmp_path):
+    (tmp_path / "lucaexamplecom.session").mkdir()  # cannot be removed as a file
+    (tmp_path / "lucaexamplecom.cookiejar").write_text("x")
+    reset_session_files(str(tmp_path), "luca@example.com")
+    assert not (tmp_path / "lucaexamplecom.cookiejar").exists()
+
+
+async def test_reauth_event_at_boot_waits_for_start(hass, fake_icloud):
+    """At boot automations only listen once Home Assistant has started."""
+    events = async_capture_events(hass, EVENT_REAUTH_REQUIRED)
+    hass.set_state(CoreState.not_running)
+    fake_icloud.start_requires_2fa = True
+    fake_icloud.token_login_trusts = False
+    await _setup(hass)
+    assert not events
+    hass.set_state(CoreState.running)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    assert [e.data for e in events] == [{"account": DATA["username"]}]
+
+
+async def test_reset_waits_for_running_update(hass, fake_icloud):
+    """A reset never happens in the middle of an update."""
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    started, release = threading.Event(), threading.Event()
+
+    def slow_refresh(**kwargs):
+        started.set()
+        release.wait(5)
+
+    account.api._fmip.refresh.side_effect = slow_refresh
+    update = hass.async_add_executor_job(account.keep_alive)
+    await hass.async_add_executor_job(started.wait, 5)
+    with patch("custom_components.icloud.account.reset_session_files") as reset_files:
+        reset = hass.async_add_executor_job(account.reset_session)
+        await asyncio.sleep(0.1)
+        assert not reset.done()
+        reset_files.assert_not_called()
+        release.set()
+        await update
+        await reset
+    reset_files.assert_called_once()
+    assert account.api is None
+    assert account._unsub_fetch is None
+    # A late timer does not open a session while the sign-in is pending.
+    await hass.async_add_executor_job(account.keep_alive)
+    assert account.api is None
+    assert len(fake_icloud.instances) == 1
+
+
+async def test_reset_service_replaces_open_sign_in(hass, fake_icloud):
+    entry = await _setup(hass)
+    entry.async_start_reauth(hass)
+    await hass.async_block_till_done()
+    [old_flow] = _reauth_flows(hass)
+    with patch("custom_components.icloud.account.reset_session_files"):
+        await hass.services.async_call(
+            DOMAIN, "reset_session", {"account": DATA["username"]}, blocking=True
+        )
+        await hass.async_block_till_done()
+    [new_flow] = _reauth_flows(hass)
+    assert new_flow["flow_id"] != old_flow["flow_id"]
+
+
+async def test_skipped_device_follows_new_session(hass, fake_icloud):
+    """Devices without battery info must not keep the old session's object."""
+    entry = await _setup(hass)
+    account = entry.runtime_data
+    device = account.devices["dev1"]
+    old_object = device.device
+    account._release_api()
+    fake_icloud.unknown_battery = True
+    with patch.object(account, "_schedule_next_fetch"):
+        await hass.async_add_executor_job(account.keep_alive)
+    assert account.devices["dev1"] is device
+    assert device.device is not old_object

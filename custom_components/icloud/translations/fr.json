@@ -108,6 +108,16 @@
       },
       "name": "Jouer un son"
     },
+    "reset_session": {
+      "description": "Supprime la session iCloud enregistrée d’un compte et demande de se reconnecter. À utiliser uniquement si l’intégration est bloquée : un nouveau code de vérification sera nécessaire.",
+      "fields": {
+        "account": {
+          "description": "Votre identifiant/adresse e-mail de compte Apple.",
+          "name": "Compte"
+        }
+      },
+      "name": "Réinitialiser la session"
+    },
     "update": {
       "description": "Demande une mise à jour de l’état de tous les appareils associés à un compte Apple.",
       "fields": {

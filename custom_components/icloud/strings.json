@@ -108,6 +108,16 @@
       },
       "name": "Play sound"
     },
+    "reset_session": {
+      "description": "Deletes the saved iCloud session of an account and asks to sign in again. Use it only if the integration is stuck: a new verification code will be needed.",
+      "fields": {
+        "account": {
+          "description": "[%key:component::icloud::services::update::fields::account::description%]",
+          "name": "Account"
+        }
+      },
+      "name": "Reset session"
+    },
     "update": {
       "description": "Asks for a state update of all devices linked to an Apple Account.",
       "fields": {
