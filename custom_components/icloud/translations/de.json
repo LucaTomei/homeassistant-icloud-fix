@@ -128,5 +128,21 @@
             },
             "name": "Aktualisieren"
         }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Standort",
+                "data": {
+                    "max_location_age": "Maximales Standortalter"
+                },
+                "data_description": {
+                    "max_location_age": "Nach so vielen Minuten ohne neuen Standort von Apple wird das Gerät als \"unbekannt\" angezeigt, statt dort zu bleiben, wo es zuletzt gesehen wurde (zum Beispiel zu Hause). 0 = letzten Standort für immer behalten."
+                }
+            }
+        },
+        "error": {
+            "age_too_short": "Verwende 0 oder mindestens {min} Minuten (zwei Aktualisierungsintervalle plus 5 Minuten), sonst würde das Gerät zwischen zwei Aktualisierungen immer wieder auf \"unbekannt\" wechseln."
+        }
     }
 }

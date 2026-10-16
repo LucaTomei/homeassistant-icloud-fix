@@ -25,6 +25,7 @@ a new 2FA code (also by SMS) without starting over.
 - 🚦 **No login storms** while a re-authentication is pending
 - 🧹 **Self-healing session**: a stuck session is replaced automatically, or with one action
 - 🔔 **Event when a new code is needed**, to get a notification on your phone
+- ⏳ **Old locations expire**: a phone that stops reporting is shown as "unknown", not stuck "at home"
 - 🌍 Translated into **English, Italian, German and French**
 
 ## 🛠️ What this version fixes
@@ -45,6 +46,8 @@ a new 2FA code (also by SMS) without starting over.
 | **Requests hanging forever** on a stalled connection | Setup or polling blocked until the next restart | Requests time out (10 s to connect, 60 s to answer) and are retried |
 | **Frozen positions after a reconnection** | Entities kept the old device objects and stopped updating | Entities keep updating after a new session |
 | **Empty code submitted** | Generic error | Clear message |
+| **Device stuck "at home" for days** when Apple stops locating it (phone off, no network, location sharing turned off) | The last position was kept forever, with no way to tell how old it was | After **2 hours** (configurable) without a new position the tracker becomes `unknown`; attributes `last_located` and `location_stale` |
+| **Position not updated when Apple does not know the battery** | Devices with battery "Unknown" were skipped, location included | The location is read anyway; the battery level is removed instead of showing an old value |
 
 > [!NOTE]
 > The battery is no longer an attribute of the device tracker, use the battery sensor.
@@ -85,6 +88,25 @@ If iCloud is not configured yet:
 [![Open your Home Assistant instance and start setting up Apple iCloud.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=icloud)
 
 Or go to **Settings → Devices & services → Add integration → Apple iCloud**.
+
+### Options
+
+**Settings → Devices & services → Apple iCloud → Configure**:
+
+- **Max location age** (default 120 min): after this many minutes without a new
+  location from Apple, the device is shown as `unknown` instead of staying where it
+  was last seen. `0` keeps the last location forever (behaviour of the built-in
+  integration). Otherwise it must be at least two update intervals plus 5 minutes
+  (65 min by default), so a device never turns `unknown` between two normal
+  updates.
+  Changing it reloads the integration with the same session, no new code needed.
+
+Every tracker also has:
+
+| Attribute | Meaning |
+|---|---|
+| `last_located` | When Apple located the device for the last time |
+| `location_stale` | `true` when that location is older than the max age (state `unknown`) |
 
 ### Getting a new code
 
@@ -179,6 +201,11 @@ Versione corretta dell'integrazione Apple iCloud di Home Assistant:
   `rm -rf /config/.storage/icloud/*`);
 - evento `icloud_reauth_required` per ricevere una notifica quando serve un
   nuovo codice;
+- **posizioni vecchie che scadono**: se Apple non dà una posizione nuova per
+  2 ore (regolabile in **Configura → Età massima della posizione**) il tracker
+  diventa "sconosciuto" invece di restare "a casa"; attributi `last_located` e
+  `location_stale`;
+- posizione letta anche quando Apple non conosce la batteria;
 - traduzione italiana.
 
 Installazione: HACS → ⋮ → **Custom repositories** → aggiungi

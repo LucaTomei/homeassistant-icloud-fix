@@ -128,5 +128,21 @@
       },
       "name": "Mettre à jour"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Position",
+        "data": {
+          "max_location_age": "Âge maximal de la position"
+        },
+        "data_description": {
+          "max_location_age": "Après ce nombre de minutes sans nouvelle position d'Apple, l'appareil est affiché comme \"inconnu\" au lieu de rester là où il a été vu pour la dernière fois (par exemple à la maison). 0 = garder la dernière position pour toujours."
+        }
+      }
+    },
+    "error": {
+      "age_too_short": "Utilisez 0 ou au moins {min} minutes (deux intervalles de mise à jour plus 5 minutes), sinon l'appareil passerait sans cesse à \"inconnu\" entre deux mises à jour."
+    }
   }
 }

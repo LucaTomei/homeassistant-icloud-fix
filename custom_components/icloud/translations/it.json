@@ -128,5 +128,21 @@
       },
       "name": "Aggiorna"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Posizione",
+        "data": {
+          "max_location_age": "Età massima della posizione"
+        },
+        "data_description": {
+          "max_location_age": "Dopo questi minuti senza una posizione nuova da Apple, il dispositivo risulta \"sconosciuto\" invece di restare dove era stato visto l'ultima volta (per esempio a casa). 0 = tieni l'ultima posizione per sempre."
+        }
+      }
+    },
+    "error": {
+      "age_too_short": "Usa 0 oppure almeno {min} minuti (due intervalli di aggiornamento più 5 minuti), altrimenti il dispositivo passerebbe a \"sconosciuto\" tra un aggiornamento e l'altro."
+    }
   }
 }

@@ -128,5 +128,21 @@
             },
             "name": "Update"
         }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Location",
+                "data": {
+                    "max_location_age": "Max location age"
+                },
+                "data_description": {
+                    "max_location_age": "After this many minutes without a new location from Apple, the device is shown as \"unknown\" instead of staying where it was last seen (for example at home). 0 = keep the last location forever."
+                }
+            }
+        },
+        "error": {
+            "age_too_short": "Use 0 or at least {min} minutes (two update intervals plus 5 minutes), otherwise the device would keep switching to \"unknown\" between two updates."
+        }
     }
 }

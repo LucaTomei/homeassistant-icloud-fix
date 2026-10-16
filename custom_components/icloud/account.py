@@ -1,6 +1,6 @@
 """iCloud account."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import functools
 import logging
 import operator
@@ -43,6 +43,8 @@ from .const import (
     ATTR_BATTERY_STATUS,
     ATTR_DEVICE_NAME,
     ATTR_DEVICE_STATUS,
+    ATTR_LAST_LOCATED,
+    ATTR_LOCATION_STALE,
     ATTR_LOW_POWER_MODE,
     ATTR_OWNER_NAME,
     DEVICE_BATTERY_LEVEL,
@@ -54,6 +56,7 @@ from .const import (
     DEVICE_LOCATION_HORIZONTAL_ACCURACY,
     DEVICE_LOCATION_LATITUDE,
     DEVICE_LOCATION_LONGITUDE,
+    DEVICE_LOCATION_TIMESTAMP,
     DEVICE_LOST_MODE_CAPABLE,
     DEVICE_LOW_POWER_MODE,
     DEVICE_NAME,
@@ -63,7 +66,9 @@ from .const import (
     DEVICE_STATUS_CODES,
     DEVICE_STATUS_SET,
     DOMAIN,
+    DEFAULT_MAX_LOCATION_AGE,
     EVENT_REAUTH_REQUIRED,
+    STALE_CHECK_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -189,6 +194,8 @@ class IcloudAccount:
         max_interval: int,
         gps_accuracy_threshold: int,
         config_entry: IcloudConfigEntry,
+        max_location_age: int = DEFAULT_MAX_LOCATION_AGE,
+        tracked_device_ids: set[str] | None = None,
     ) -> None:
         """Initialize an iCloud account."""
         self.hass = hass
@@ -198,6 +205,9 @@ class IcloudAccount:
         self._fetch_interval: float = max_interval
         self._max_interval = max_interval
         self._gps_accuracy_threshold = gps_accuracy_threshold
+        self._max_location_age = max_location_age
+        # Devices that already have entities from this integration.
+        self._tracked_device_ids = tracked_device_ids or set()
 
         self._icloud_dir = icloud_dir
 
@@ -361,9 +371,17 @@ class IcloudAccount:
                 known_device.set_device(device)
 
             if (
-                status[DEVICE_BATTERY_STATUS] == "Unknown"
-                or status.get(DEVICE_BATTERY_LEVEL) is None
+                known_device is None
+                and not _has_battery(status)
+                and not (
+                    _has_location(status) and device_id in self._tracked_device_ids
+                )
             ):
+                # Never tracked and no battery (a Mac, an old device...): skip
+                # it, as before. Known devices are always updated, so that a
+                # phone that stops reporting is not stuck on its last state; a
+                # phone that is off while Home Assistant starts keeps its
+                # entities (its old location then expires).
                 continue
 
             if self._devices.get(device_id) is not None:
@@ -517,17 +535,18 @@ class IcloudAccount:
         """Calculate new interval between two API fetch (in minutes)."""
         intervals = {"default": self._max_interval}
         for device in self._devices.values():
-            # Max interval if no location
-            if device.location is None:
+            location = device.fresh_location
+            # Max interval if no (recent) location
+            if location is None:
                 continue
 
             current_zone = run_callback_threadsafe(
                 self.hass.loop,
                 async_active_zone,
                 self.hass,
-                device.location[DEVICE_LOCATION_LATITUDE],
-                device.location[DEVICE_LOCATION_LONGITUDE],
-                device.location[DEVICE_LOCATION_HORIZONTAL_ACCURACY],
+                location[DEVICE_LOCATION_LATITUDE],
+                location[DEVICE_LOCATION_LONGITUDE],
+                location[DEVICE_LOCATION_HORIZONTAL_ACCURACY],
             ).result()
 
             # Max interval if in zone
@@ -546,8 +565,8 @@ class IcloudAccount:
                 zone_state_lat = zone_state.attributes[DEVICE_LOCATION_LATITUDE]
                 zone_state_long = zone_state.attributes[DEVICE_LOCATION_LONGITUDE]
                 zone_distance = distance(
-                    device.location[DEVICE_LOCATION_LATITUDE],
-                    device.location[DEVICE_LOCATION_LONGITUDE],
+                    location[DEVICE_LOCATION_LATITUDE],
+                    location[DEVICE_LOCATION_LONGITUDE],
                     zone_state_lat,
                     zone_state_long,
                 )
@@ -677,6 +696,22 @@ class IcloudAccount:
         return self._family_members_fullname
 
     @property
+    def max_location_age_option(self) -> int:
+        """The max location age as configured."""
+        return self._max_location_age
+
+    @property
+    def max_location_age(self) -> int:
+        """Minutes after which a location is not used any more (0 = never).
+
+        Never shorter than min_location_age(), otherwise a tracker would
+        become "unknown" between two normal updates.
+        """
+        if not self._max_location_age:
+            return 0
+        return max(self._max_location_age, min_location_age(self._max_interval))
+
+    @property
     def fetch_interval(self) -> float:
         """Return the account fetch interval."""
         return self._fetch_interval
@@ -717,6 +752,8 @@ class IcloudDevice:
         self._battery_level: int | None = None
         self._battery_status = None
         self._location = None
+        self._located_at: datetime | None = None
+        self._location_stamp: Any = None
 
         self._attrs = {
             ATTR_ACCOUNT_FETCH_INTERVAL: self._account.fetch_interval,
@@ -743,22 +780,44 @@ class IcloudDevice:
         device_status = DEVICE_STATUS_CODES.get(self._status[DEVICE_STATUS], "error")
         self._attrs[ATTR_DEVICE_STATUS] = device_status
 
-        self._battery_status = self._status[DEVICE_BATTERY_STATUS]
-        self._attrs[ATTR_BATTERY_STATUS] = self._battery_status
-        device_battery_level = self._status.get(DEVICE_BATTERY_LEVEL, 0)
-        if self._battery_status != "Unknown" and device_battery_level is not None:
-            self._battery_level = int(device_battery_level * 100)
-            self._attrs[ATTR_BATTERY] = self._battery_level
-            self._attrs[ATTR_LOW_POWER_MODE] = self._status[DEVICE_LOW_POWER_MODE]
+        had_battery = self._battery_level is not None
+        had_location = self._location is not None
 
-            if (
-                self._status[DEVICE_LOCATION]
-                and self._status[DEVICE_LOCATION][DEVICE_LOCATION_LATITUDE]
-            ):
-                location = self._status[DEVICE_LOCATION]
-                if self._location is None:
-                    dispatcher_send(self._account.hass, self._account.signal_device_new)
-                self._location = location
+        self._battery_status = self._status.get(DEVICE_BATTERY_STATUS)
+        self._attrs[ATTR_BATTERY_STATUS] = self._battery_status
+        if _has_battery(self._status):
+            self._battery_level = int(self._status[DEVICE_BATTERY_LEVEL] * 100)
+            self._attrs[ATTR_BATTERY] = self._battery_level
+            self._attrs[ATTR_LOW_POWER_MODE] = self._status.get(DEVICE_LOW_POWER_MODE)
+        else:
+            # Apple does not know the battery (phone off, no network): do not
+            # keep showing the last level as if it were current.
+            self._battery_level = None
+            self._attrs.pop(ATTR_BATTERY, None)
+            self._attrs.pop(ATTR_LOW_POWER_MODE, None)
+
+        # The location does not depend on the battery: Apple can still report
+        # where a phone is when it does not know its battery.
+        if _has_location(self._status):
+            self._update_location(self._status[DEVICE_LOCATION])
+
+        # A battery or a location seen for the first time may need a new entity
+        # (battery sensor, tracker). Sent once the values are stored.
+        if (not had_battery and self._battery_level is not None) or (
+            not had_location and self._location is not None
+        ):
+            dispatcher_send(self._account.hass, self._account.signal_device_new)
+
+    def _update_location(self, location: dict[str, Any]) -> None:
+        """Keep the newest location reported by Apple."""
+        stamp = location.get(DEVICE_LOCATION_TIMESTAMP)
+        if stamp is not None and stamp == self._location_stamp:
+            return  # the same location as before: it does not get younger
+        self._location_stamp = stamp
+        located_at = _location_time(location)
+        if self._located_at is None or located_at >= self._located_at:
+            self._location = location
+            self._located_at = located_at
 
     def play_sound(self) -> None:
         """Play sound on the device."""
@@ -827,10 +886,80 @@ class IcloudDevice:
 
     @property
     def location(self) -> dict[str, Any] | None:
-        """Return the Apple device location."""
+        """Return the last location reported by Apple, however old."""
+        return self._location
+
+    @property
+    def located_at(self) -> datetime | None:
+        """When Apple located the device for the last time."""
+        return self._located_at
+
+    @property
+    def location_stale(self) -> bool:
+        """Whether the last location is too old to be used."""
+        max_age = self._account.max_location_age
+        if not max_age or self._located_at is None:
+            return False
+        return utcnow() - self._located_at > timedelta(minutes=max_age)
+
+    @property
+    def fresh_location(self) -> dict[str, Any] | None:
+        """The location, or None when there is none or it is too old."""
+        if self._location is None or self.location_stale:
+            return None
         return self._location
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the attributes."""
-        return self._attrs
+        return dict(self._attrs)
+
+    @property
+    def location_attributes(self) -> dict[str, Any]:
+        """Age of the location (tracker only: it re-checks it every few minutes)."""
+        if self._located_at is None:
+            return {}
+        return {
+            ATTR_LAST_LOCATED: self._located_at.isoformat(),
+            ATTR_LOCATION_STALE: self.location_stale,
+        }
+
+
+def min_location_age(max_interval: float) -> int:
+    """Shortest usable max location age: two update intervals plus a margin.
+
+    Each update usually gets the location located during the previous one,
+    and updates can be late (slow answers, retries after an error).
+    """
+    return int(2 * max_interval) + STALE_CHECK_INTERVAL
+
+
+def _has_battery(status: dict[str, Any]) -> bool:
+    """Whether Apple reports a battery level for the device."""
+    return (
+        status.get(DEVICE_BATTERY_STATUS) not in (None, "Unknown")
+        and status.get(DEVICE_BATTERY_LEVEL) is not None
+    )
+
+
+def _has_location(status: dict[str, Any]) -> bool:
+    """Whether Apple reports coordinates for the device."""
+    location = status.get(DEVICE_LOCATION)
+    return bool(
+        location
+        and location.get(DEVICE_LOCATION_LATITUDE) is not None
+        and location.get(DEVICE_LOCATION_LONGITUDE) is not None
+    )
+
+
+def _location_time(location: dict[str, Any]) -> datetime:
+    """When the location was taken (Apple's time stamp, or now if missing)."""
+    stamp = location.get(DEVICE_LOCATION_TIMESTAMP)
+    if isinstance(stamp, (int, float)) and stamp > 0:
+        try:
+            located = datetime.fromtimestamp(stamp / 1000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return utcnow()
+        # never in the future (clock differences)
+        return min(located, utcnow())
+    return utcnow()

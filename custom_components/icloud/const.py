@@ -9,10 +9,15 @@ ATTRIBUTION = "Data provided by Apple iCloud"
 CONF_WITH_FAMILY = "with_family"
 CONF_MAX_INTERVAL = "max_interval"
 CONF_GPS_ACCURACY_THRESHOLD = "gps_accuracy_threshold"
+CONF_MAX_LOCATION_AGE = "max_location_age"
 
 DEFAULT_WITH_FAMILY = False
 DEFAULT_MAX_INTERVAL = 30  # min
 DEFAULT_GPS_ACCURACY_THRESHOLD = 500  # meters
+# A location older than this is not used any more: the tracker becomes "unknown"
+# instead of staying where the device was last seen. 0 = keep it forever.
+DEFAULT_MAX_LOCATION_AGE = 120  # min
+STALE_CHECK_INTERVAL = 5  # min
 
 # to store the cookie
 STORAGE_KEY = DOMAIN
@@ -33,6 +38,7 @@ DEVICE_LOCATION = "location"
 DEVICE_LOCATION_HORIZONTAL_ACCURACY = "horizontalAccuracy"
 DEVICE_LOCATION_LATITUDE = "latitude"
 DEVICE_LOCATION_LONGITUDE = "longitude"
+DEVICE_LOCATION_TIMESTAMP = "timeStamp"  # ms since epoch
 DEVICE_LOST_MODE_CAPABLE = "lostModeCapable"
 DEVICE_LOW_POWER_MODE = "lowPowerMode"
 DEVICE_NAME = "name"
@@ -103,3 +109,5 @@ ATTR_LOST_DEVICE_MESSAGE = "message"
 ATTR_LOST_DEVICE_NUMBER = "number"
 ATTR_LOST_DEVICE_SOUND = "sound"
 ATTR_OWNER_NAME = "owner_fullname"
+ATTR_LAST_LOCATED = "last_located"
+ATTR_LOCATION_STALE = "location_stale"

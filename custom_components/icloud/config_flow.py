@@ -17,12 +17,25 @@ from pyicloud.exceptions import (
 import requests
 import voluptuous as vol
 
-from homeassistant.config_entries import SOURCE_USER, ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    SOURCE_USER,
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import callback
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 from homeassistant.helpers.storage import Store
 
 from .account import (
     apple_status_code,
+    min_location_age,
     is_transient_error,
     is_wrong_password,
     reset_session_files,
@@ -30,9 +43,11 @@ from .account import (
 from .const import (
     CONF_GPS_ACCURACY_THRESHOLD,
     CONF_MAX_INTERVAL,
+    CONF_MAX_LOCATION_AGE,
     CONF_WITH_FAMILY,
     DEFAULT_GPS_ACCURACY_THRESHOLD,
     DEFAULT_MAX_INTERVAL,
+    DEFAULT_MAX_LOCATION_AGE,
     DEFAULT_WITH_FAMILY,
     DOMAIN,
     STORAGE_KEY,
@@ -76,10 +91,58 @@ _STATUS_TEXT = {
 _LOGGER = logging.getLogger(__name__)
 
 
+class IcloudOptionsFlow(OptionsFlow):
+    """Options that can be changed at any time, without signing in again."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        errors: dict[str, str] = {}
+        shortest = min_location_age(
+            self.config_entry.data.get(CONF_MAX_INTERVAL, DEFAULT_MAX_INTERVAL)
+        )
+        current = self.config_entry.options.get(
+            CONF_MAX_LOCATION_AGE, DEFAULT_MAX_LOCATION_AGE
+        )
+        if user_input is not None:
+            current = int(user_input[CONF_MAX_LOCATION_AGE])
+            if 0 < current < shortest:
+                # About two updates or less: the tracker would keep switching
+                # between "unknown" and the position.
+                errors[CONF_MAX_LOCATION_AGE] = "age_too_short"
+            else:
+                return self.async_create_entry(data={CONF_MAX_LOCATION_AGE: current})
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_MAX_LOCATION_AGE, default=current): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0,
+                            max=1440,
+                            step=5,
+                            unit_of_measurement="min",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    )
+                }
+            ),
+            errors=errors,
+            description_placeholders={"min": str(shortest)},
+        )
+
+
 class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle an iCloud config flow."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> IcloudOptionsFlow:
+        """Get the options flow."""
+        return IcloudOptionsFlow()
 
     def __init__(self) -> None:
         """Initialize iCloud config flow."""
